@@ -1,11 +1,18 @@
 #######################################################
-# AWS PROVIDER AND AVAILABILITY ZONES
+# DATA SOURCES
 #######################################################
-provider "aws" {
-  region = "us-east-1"
-}
 
 data "aws_availability_zones" "available" {}
+
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+}
 
 #######################################################
 # NETWORKING - VPC, SUBNETS, INTERNET ACCESS
@@ -13,6 +20,7 @@ data "aws_availability_zones" "available" {}
 
 resource "aws_vpc" "main" {
   cidr_block = "10.0.0.0/16"
+
   tags = {
     Name = "flutter-vpc"
   }
@@ -20,6 +28,7 @@ resource "aws_vpc" "main" {
 
 resource "aws_internet_gateway" "gw" {
   vpc_id = aws_vpc.main.id
+
   tags = {
     Name = "flutter-gateway"
   }
@@ -39,9 +48,14 @@ resource "aws_subnet" "public" {
 
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
+
   route {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.gw.id
+  }
+
+  tags = {
+    Name = "flutter-public-rt"
   }
 }
 
@@ -58,7 +72,9 @@ resource "aws_route_table_association" "a" {
 resource "aws_security_group" "web_sg" {
   vpc_id = aws_vpc.main.id
   name   = "flutter-web-sg"
+  description = "Security group for Flutter, Grafana, and Prometheus"
 
+  # HTTP (Load Balancer / App)
   ingress {
     from_port   = 80
     to_port     = 80
@@ -66,6 +82,7 @@ resource "aws_security_group" "web_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # SSH (for EC2 access)
   ingress {
     from_port   = 22
     to_port     = 22
@@ -73,6 +90,25 @@ resource "aws_security_group" "web_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # Grafana web UI
+  ingress {
+    description = "Allow Grafana web access"
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Prometheus web UI
+  ingress {
+    description = "Allow Prometheus web access"
+    from_port   = 9090
+    to_port     = 9090
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Allow all outbound traffic
   egress {
     from_port   = 0
     to_port     = 0
@@ -88,16 +124,6 @@ resource "aws_security_group" "web_sg" {
 #######################################################
 # EC2 LAUNCH TEMPLATE + USERDATA (Docker run)
 #######################################################
-
-data "aws_ami" "amazon_linux" {
-  most_recent = true
-  owners      = ["amazon"]
-
-  filter {
-    name   = "name"
-    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
-  }
-}
 
 resource "aws_launch_template" "flutter" {
   name_prefix   = "flutter-app-"
@@ -126,12 +152,20 @@ resource "aws_lb" "flutter_lb" {
   load_balancer_type = "application"
   security_groups    = [aws_security_group.web_sg.id]
   subnets            = aws_subnet.public[*].id
+
+  tags = {
+    Name = "flutter-lb"
+  }
 }
 
 resource "aws_lb_target_group" "flutter_tg" {
   port     = 80
   protocol = "HTTP"
   vpc_id   = aws_vpc.main.id
+
+  tags = {
+    Name = "flutter-tg"
+  }
 }
 
 resource "aws_lb_listener" "http" {
@@ -153,10 +187,12 @@ resource "aws_autoscaling_group" "flutter_asg" {
   desired_capacity     = 1
   max_size             = 3
   min_size             = 1
+
   launch_template {
     id      = aws_launch_template.flutter.id
     version = "$Latest"
   }
+
   vpc_zone_identifier = aws_subnet.public[*].id
   target_group_arns   = [aws_lb_target_group.flutter_tg.arn]
   health_check_type   = "EC2"
@@ -171,17 +207,17 @@ resource "aws_autoscaling_group" "flutter_asg" {
 resource "aws_autoscaling_policy" "scale_out" {
   name                   = "scale-out"
   autoscaling_group_name = aws_autoscaling_group.flutter_asg.name
-  adjustment_type         = "ChangeInCapacity"
-  scaling_adjustment      = 1
-  cooldown                = 300
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = 1
+  cooldown               = 300
 }
 
 resource "aws_autoscaling_policy" "scale_in" {
   name                   = "scale-in"
   autoscaling_group_name = aws_autoscaling_group.flutter_asg.name
-  adjustment_type         = "ChangeInCapacity"
-  scaling_adjustment      = -1
-  cooldown                = 300
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = -1
+  cooldown               = 300
 }
 
 #######################################################
@@ -218,13 +254,4 @@ resource "aws_cloudwatch_metric_alarm" "cpu_low" {
     AutoScalingGroupName = aws_autoscaling_group.flutter_asg.name
   }
   alarm_actions = [aws_autoscaling_policy.scale_in.arn]
-}
-
-#######################################################
-# OUTPUTS
-#######################################################
-
-output "load_balancer_dns" {
-  description = "Access your Flutter web app here"
-  value       = aws_lb.flutter_lb.dns_name
 }
