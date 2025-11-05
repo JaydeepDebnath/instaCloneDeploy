@@ -3,76 +3,43 @@
 # User Data for Flutter Web App EC2 Instance
 # --------------------------
 
-# Update system packages and install Docker
+set -e
+LOG_FILE="/var/log/user-data.log"
+exec > >(tee -a $LOG_FILE) 2>&1
+
+echo "✅ Starting Flutter Web User Data Script at $(date)"
+
+# Update system and install Docker
 yum update -y
 amazon-linux-extras install docker -y
-
-# Start and enable Docker service
 systemctl enable docker
 systemctl start docker
-
-# Add ec2-user to docker group (optional)
 usermod -aG docker ec2-user
 
-# Define image name (without hardcoding version)
-IMAGE_NAME="jay0604/flutter-web:latest"
+# Pull and run Flutter web container
+IMAGE_NAME="jay0604/flutter-web:1.0.0-1"
+CONTAINER_NAME="flutter-web"
 
-# Always pull the latest version of your image
-docker pull $IMAGE_NAME
+echo "🔹 Pulling Docker image..."
+docker pull --platform linux/amd64 $IMAGE_NAME
 
-# Stop and remove any existing container on port 80
-EXISTING_CONTAINER=$(docker ps -q --filter "publish=80")
+# Stop any existing container
+EXISTING_CONTAINER=$(docker ps -q --filter "name=$CONTAINER_NAME")
 if [ -n "$EXISTING_CONTAINER" ]; then
+    echo "🔹 Stopping existing container..."
     docker stop $EXISTING_CONTAINER
     docker rm $EXISTING_CONTAINER
 fi
 
-# Run the latest Flutter web app container
-docker run -d -p 80:80 --name flutter-web $IMAGE_NAME
+# Run container on port 80
+echo "🔹 Starting Flutter web container..."
+docker run -d --platform linux/amd64 -p 80:80 --name $CONTAINER_NAME $IMAGE_NAME
 
-# (Optional) Install Node Exporter for Prometheus monitoring
-cd /opt
-curl -LO https://github.com/prometheus/node_exporter/releases/latest/download/node_exporter-1.8.1.linux-amd64.tar.gz
-tar xvf node_exporter-1.8.1.linux-amd64.tar.gz
-cd node_exporter-1.8.1.linux-amd64
-nohup ./node_exporter > /dev/null 2>&1 &
-echo "Node Exporter running on port 9100"
+# Wait until app responds
+echo "🔹 Waiting for Flutter app to start..."
+until curl -s http://localhost:80/index.html; do
+    echo "Waiting 5s..."
+    sleep 5
+done
 
-# --------------------------
-# Prometheus Setup
-# --------------------------
-
-mkdir -p /home/ec2-user/prometheus
-cat <<EOF > /home/ec2-user/prometheus/prometheus.yml
-global:
-  scrape_interval: 15s
-
-scrape_configs:
-  - job_name: 'flutter_app'
-    static_configs:
-      - targets: ['localhost:80']
-
-  - job_name: 'node_exporter'
-    static_configs:
-      - targets: ['localhost:9100']
-EOF
-
-# Run Prometheus container
-docker run -d \
-  -p 9090:9090 \
-  -v /home/ec2-user/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml \
-  --name prometheus prom/prometheus
-
-
-# --------------------------
-# Grafana Setup
-# --------------------------
-
-docker run -d \
-  -p 3000:3000 \
-  --name grafana grafana/grafana
-
-echo "✅ Flutter app running on port 80"
-echo "✅ Prometheus running on port 9090"
-echo "✅ Grafana running on port 3000"
-echo "✅ Node Exporter running on port 9100"
+echo "✅ Flutter app is running and ready at $(date)"

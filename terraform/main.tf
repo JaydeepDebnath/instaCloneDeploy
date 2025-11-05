@@ -10,7 +10,7 @@ data "aws_ami" "amazon_linux" {
 
   filter {
     name   = "name"
-    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+    values = ["amzn2-ami-hvm-2.0.20250902.3-x86_64-gp2"]
   }
 }
 
@@ -22,7 +22,7 @@ resource "aws_vpc" "main" {
   cidr_block = "10.0.0.0/16"
 
   tags = {
-    Name = "flutter-vpc"
+    Name = "${var.project_name}-vpc"
   }
 }
 
@@ -30,7 +30,7 @@ resource "aws_internet_gateway" "gw" {
   vpc_id = aws_vpc.main.id
 
   tags = {
-    Name = "flutter-gateway"
+    Name = "${var.project_name}-igw"
   }
 }
 
@@ -42,7 +42,7 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = true
 
   tags = {
-    Name = "flutter-public-subnet-${count.index + 1}"
+    Name = "${var.project_name}-public-subnet-${count.index + 1}"
   }
 }
 
@@ -55,60 +55,42 @@ resource "aws_route_table" "public" {
   }
 
   tags = {
-    Name = "flutter-public-rt"
+    Name = "${var.project_name}-rt"
   }
 }
 
-resource "aws_route_table_association" "a" {
+resource "aws_route_table_association" "public_assoc" {
   count          = length(aws_subnet.public)
   subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public.id
 }
 
 #######################################################
-# SECURITY GROUP
+# SECURITY GROUPS
 #######################################################
 
-resource "aws_security_group" "web_sg" {
-  vpc_id = aws_vpc.main.id
-  name   = "flutter-web-sg"
-  description = "Security group for Flutter, Grafana, and Prometheus"
-
-  # HTTP (Load Balancer / App)
+# ALB Security Group
+resource "aws_security_group" "flutter_sg" {
+  vpc_id      = aws_vpc.main.id
+  name        = "${var.project_name}-lb-sg"
+  description = "Security group for ALB"
+  
   ingress {
+    description = "Allow HTTP from anywhere"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # SSH (for EC2 access)
   ingress {
+    description = "Allow SSH from my IP"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["45.123.162.128/32"]
   }
 
-  # Grafana web UI
-  ingress {
-    description = "Allow Grafana web access"
-    from_port   = 3000
-    to_port     = 3000
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # Prometheus web UI
-  ingress {
-    description = "Allow Prometheus web access"
-    from_port   = 9090
-    to_port     = 9090
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # Allow all outbound traffic
   egress {
     from_port   = 0
     to_port     = 0
@@ -117,28 +99,49 @@ resource "aws_security_group" "web_sg" {
   }
 
   tags = {
-    Name = "flutter-web-sg"
+    Name = "${var.project_name}-lb-sg"
   }
 }
 
-#######################################################
-# EC2 LAUNCH TEMPLATE + USERDATA (Docker run)
-#######################################################
+# EC2 Security Group
+resource "aws_security_group" "flutter_ec2_sg" {
+  vpc_id      = aws_vpc.main.id
+  name        = "${var.project_name}-ec2-sg"
+  description = "Security group for Flutter EC2 instances"
 
-resource "aws_launch_template" "flutter" {
-  name_prefix   = "flutter-app-"
-  image_id      = data.aws_ami.amazon_linux.id
-  instance_type = "t2.micro"
+  ingress {
+    description     = "Allow HTTP from ALB"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.flutter_sg.id]
+  }
 
-  user_data = base64encode(file("${path.module}/userdata.sh"))
+  ingress {
+    description = "Allow Node Exporter"
+    from_port   = 9100
+    to_port     = 9100
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+  }
 
-  vpc_security_group_ids = [aws_security_group.web_sg.id]
+  ingress {
+    description = "Allow SSH from my IP"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["45.123.162.128/32"]
+  }
 
-  tag_specifications {
-    resource_type = "instance"
-    tags = {
-      Name = "flutter-instance"
-    }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.project_name}-ec2-sg"
   }
 }
 
@@ -147,24 +150,33 @@ resource "aws_launch_template" "flutter" {
 #######################################################
 
 resource "aws_lb" "flutter_lb" {
-  name               = "flutter-lb"
+  name               = "${var.project_name}-lb"
   internal           = false
   load_balancer_type = "application"
-  security_groups    = [aws_security_group.web_sg.id]
+  security_groups    = [aws_security_group.flutter_sg.id]
   subnets            = aws_subnet.public[*].id
 
   tags = {
-    Name = "flutter-lb"
+    Name = "${var.project_name}-lb"
   }
 }
 
 resource "aws_lb_target_group" "flutter_tg" {
-  port     = 80
+  port     = var.instance_port
   protocol = "HTTP"
   vpc_id   = aws_vpc.main.id
 
+  health_check {
+    path                = "/index.html"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 5
+    matcher             = "200-399"
+  }
+
   tags = {
-    Name = "flutter-tg"
+    Name = "${var.project_name}-tg"
   }
 }
 
@@ -180,78 +192,53 @@ resource "aws_lb_listener" "http" {
 }
 
 #######################################################
-# AUTO SCALING GROUP + POLICIES
+# KEY PAIR FOR SSH
 #######################################################
+resource "aws_key_pair" "deployer" {
+  key_name   = "${var.project_name}-key"
+  public_key = file("/Users/jaydeep/.ssh/sample-project-one.pub")
+}
 
+#######################################################
+# LAUNCH TEMPLATE (FLUTTER APP)
+#######################################################
+resource "aws_launch_template" "flutter" {
+  name_prefix   = "${var.project_name}-lt-"
+  image_id      = data.aws_ami.amazon_linux.id
+  instance_type = var.instance_type
+  key_name      = aws_key_pair.deployer.key_name
+  user_data     = base64encode(file("${path.module}/userdata.sh"))
+  vpc_security_group_ids = [aws_security_group.flutter_ec2_sg.id]
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "${var.project_name}-instance"
+    }
+  }
+}
+
+#######################################################
+# AUTO SCALING GROUP (FLUTTER APP)
+#######################################################
 resource "aws_autoscaling_group" "flutter_asg" {
-  desired_capacity     = 1
-  max_size             = 3
-  min_size             = 1
+  desired_capacity           = var.desired_capacity
+  max_size                   = var.max_size
+  min_size                   = var.min_size
 
   launch_template {
     id      = aws_launch_template.flutter.id
     version = "$Latest"
   }
 
-  vpc_zone_identifier = aws_subnet.public[*].id
-  target_group_arns   = [aws_lb_target_group.flutter_tg.arn]
-  health_check_type   = "EC2"
+  vpc_zone_identifier       = aws_subnet.public[*].id
+  target_group_arns         = [aws_lb_target_group.flutter_tg.arn]
+  health_check_type         = "ELB"
+  health_check_grace_period = 300
 
   tag {
     key                 = "Name"
-    value               = "flutter-asg"
+    value               = "${var.project_name}-asg"
     propagate_at_launch = true
   }
-}
-
-resource "aws_autoscaling_policy" "scale_out" {
-  name                   = "scale-out"
-  autoscaling_group_name = aws_autoscaling_group.flutter_asg.name
-  adjustment_type        = "ChangeInCapacity"
-  scaling_adjustment     = 1
-  cooldown               = 300
-}
-
-resource "aws_autoscaling_policy" "scale_in" {
-  name                   = "scale-in"
-  autoscaling_group_name = aws_autoscaling_group.flutter_asg.name
-  adjustment_type        = "ChangeInCapacity"
-  scaling_adjustment     = -1
-  cooldown               = 300
-}
-
-#######################################################
-# CLOUDWATCH ALARMS
-#######################################################
-
-resource "aws_cloudwatch_metric_alarm" "cpu_high" {
-  alarm_name          = "cpu_high"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = 120
-  statistic           = "Average"
-  threshold           = 60
-  alarm_description   = "Scale up when CPU > 60%"
-  dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.flutter_asg.name
-  }
-  alarm_actions = [aws_autoscaling_policy.scale_out.arn]
-}
-
-resource "aws_cloudwatch_metric_alarm" "cpu_low" {
-  alarm_name          = "cpu_low"
-  comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = 120
-  statistic           = "Average"
-  threshold           = 20
-  alarm_description   = "Scale down when CPU < 20%"
-  dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.flutter_asg.name
-  }
-  alarm_actions = [aws_autoscaling_policy.scale_in.arn]
 }
